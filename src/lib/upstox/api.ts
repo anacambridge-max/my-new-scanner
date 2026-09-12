@@ -36,6 +36,27 @@ export interface UpstoxQuote {
   year_low?: number;
 }
 
+export interface UpstoxDailyOHLC {
+  last_price?: number;
+  instrument_token?: string;
+  prev_ohlc?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    ts: number;
+  };
+  live_ohlc?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    ts: number;
+  };
+}
+
 function upstoxHeaders(accessToken: string) {
   return {
     Authorization: `Bearer ${accessToken}`,
@@ -71,10 +92,7 @@ export async function fetchHistoricalCandles(
 /**
  * Fetch current-session 5-minute candles.
  * Primary path is Upstox Intraday Candle V3. If it is unavailable/empty,
- * use the V3 Historical Candle endpoint for the recent five-day window.
- * The historical response is retained in full so the scanner has enough
- * observations for 20 EMA and volume calculations, while the latest candle
- * remains the most recent available trading-session candle.
+ * use the V3 Historical Candle endpoint for the current trading day.
  */
 export async function fetchIntradayCandles(
   instrumentKey: string,
@@ -98,11 +116,10 @@ export async function fetchIntradayCandles(
   }
 
   const today = formatDateIST(new Date());
-  const from = formatDateIST(offsetDays(new Date(), -5));
   const historical = await fetchHistoricalCandles(
     instrumentKey,
     accessToken,
-    from,
+    today,
     today
   );
 
@@ -112,6 +129,29 @@ export async function fetchIntradayCandles(
   }
 
   return historical;
+}
+
+/**
+ * Fetch previous-session daily OHLC for a batch of instruments.
+ * Upstox V3 supports a large batch (up to 500 keys) and returns prev_ohlc,
+ * so the scanner does not need one historical request per stock just to
+ * calculate previous-day high/low levels.
+ */
+export async function fetchDailyOHLC(
+  instrumentKeys: string[],
+  accessToken: string
+): Promise<Record<string, UpstoxDailyOHLC>> {
+  if (instrumentKeys.length === 0) return {};
+
+  const keysParam = instrumentKeys.join(",");
+  const url = `${UPSTOX_V3_BASE}/market-quote/ohlc?instrument_key=${encodeURIComponent(keysParam)}&interval=1d`;
+
+  const response = await axios.get(url, {
+    headers: upstoxHeaders(accessToken),
+    timeout: 20000,
+  });
+
+  return response.data?.data || {};
 }
 
 /**
