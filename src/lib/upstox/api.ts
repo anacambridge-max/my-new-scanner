@@ -69,13 +69,12 @@ export async function fetchHistoricalCandles(
 }
 
 /**
- * Fetch the current trading day's 5-minute candles.
- *
- * Upstox documents the V3 intraday endpoint for 5-minute candles, but after
- * the market closes some environments can return an empty intraday payload.
- * In that case we deliberately use the V3 historical endpoint over a small
- * date window and keep only today's IST candles. This avoids losing the
- * candle/volume/EMA pipeline merely because the market is closed.
+ * Fetch current-session 5-minute candles.
+ * Primary path is Upstox Intraday Candle V3. If it is unavailable/empty,
+ * use the V3 Historical Candle endpoint for the recent five-day window.
+ * The historical response is retained in full so the scanner has enough
+ * observations for 20 EMA and volume calculations, while the latest candle
+ * remains the most recent available trading-session candle.
  */
 export async function fetchIntradayCandles(
   instrumentKey: string,
@@ -93,26 +92,26 @@ export async function fetchIntradayCandles(
     if (Array.isArray(candles) && candles.length > 0) return candles;
   } catch (error) {
     console.warn(
-      `[Upstox] Intraday V3 failed for ${instrumentKey}; trying historical V3 fallback:`,
+      `[Upstox] Intraday V3 failed for ${instrumentKey}; using historical 5m fallback:`,
       error instanceof Error ? error.message : String(error)
     );
   }
 
-  // Historical V3 is more reliable after market close. Query a small window
-  // (yesterday -> today) and filter by the actual IST calendar date.
   const today = formatDateIST(new Date());
-  const yesterday = formatDateIST(offsetDays(new Date(), -1));
+  const from = formatDateIST(offsetDays(new Date(), -5));
   const historical = await fetchHistoricalCandles(
     instrumentKey,
     accessToken,
-    yesterday,
+    from,
     today
   );
 
-  return historical.filter((candle) => {
-    const timestamp = String(candle?.[0] ?? "");
-    return timestamp.slice(0, 10) === today;
-  });
+  if (!Array.isArray(historical) || historical.length === 0) {
+    console.warn(`[Upstox] No 5m historical candles returned for ${instrumentKey}`);
+    return [];
+  }
+
+  return historical;
 }
 
 /**
