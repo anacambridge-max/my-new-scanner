@@ -153,7 +153,6 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
   const closes: number[] = [];
   const volumes: number[] = [];
   const trValues: number[] = [];
-  let latest: HistoricalPrimeSignal | null = null;
   let firstSignalLatestSession: HistoricalPrimeSignal | null = null;
 
   for (let i = 0; i < candles.length; i++) {
@@ -204,14 +203,14 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const roomToSell = (c.close - nextSupBelow) > atr * ROOM_ATR;
 
     const buyBounce = !!nearSupport && strongBull && volConfirmed && emaLong && roomToBuy && !emaChoppy;
-    const buyBreakout = (c.close >= levels.yh || c.close >= levels.r1 || c.close >= levels.r2 || c.close >= levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy && !emaChoppy;
+    const buyBreakout = (c.close > levels.yh || c.close > levels.r1 || c.close > levels.r2 || c.close > levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy && !emaChoppy;
     const sellRejection = !!nearResistance && strongBear && volConfirmed && emaShort && roomToSell && !emaChoppy;
-    const sellBreakdown = (c.close <= levels.yl || c.close <= levels.s1 || c.close <= levels.s2 || c.close <= levels.s3) && strongBear && volConfirmed && emaShort && roomToSell && !emaChoppy;
+    const sellBreakdown = (c.close < levels.yl || c.close < levels.s1 || c.close < levels.s2 || c.close < levels.s3) && strongBear && volConfirmed && emaShort && roomToSell && !emaChoppy;
 
     const setupBuy = buyBounce || buyBreakout;
     const setupSell = sellRejection || sellBreakdown;
 
-    if (setupBuy || setupSell) {
+    if (sessionDate === latestSessionDate && (setupBuy || setupSell)) {
       const direction = setupBuy ? "BUY" : "SELL";
       const setup = setupBuy ? (buyBreakout ? "BREAKOUT" : "BOUNCE") : (sellBreakdown ? "BREAKDOWN" : "REJECTION");
       const level = setup === "BOUNCE" ? (nearSupport ?? "SUPPORT") : setup === "REJECTION" ? (nearResistance ?? "RESISTANCE") : levelNameForBreakout(c, levels, direction);
@@ -219,7 +218,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
         ? Math.min(levels.yl, levels.s1, i > 0 ? candles[i - 1].low : c.low) - atr * SL_BUFFER_ATR
         : Math.max(levels.yh, levels.r1, i > 0 ? candles[i - 1].high : c.high) + atr * SL_BUFFER_ATR;
       const risk = Math.abs(c.close - sl);
-      const signal: HistoricalPrimeSignal = {
+      firstSignalLatestSession = {
         direction, setup, level,
         triggerPrice: Number(c.close.toFixed(2)),
         signalTimestamp: c.timestamp,
@@ -231,12 +230,11 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
         sl: Number(sl.toFixed(2)),
         riskPerShare: Number(risk.toFixed(2)),
       };
-      latest = signal;
-      if (sessionDate === latestSessionDate && firstSignalLatestSession === null) firstSignalLatestSession = signal;
+      break;
     }
 
     prevClose = c.close;
   }
 
-  return firstSignalLatestSession ?? latest;
+  return firstSignalLatestSession;
 }
