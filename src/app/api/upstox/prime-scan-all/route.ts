@@ -118,17 +118,15 @@ export async function GET() {
     catch (e) { console.warn("[prime] daily OHLC batch failed", e instanceof Error ? e.message : String(e)); }
 
     const withQuotes = universe.filter(i => Number(quotes[i.instrumentKey]?.last_price) > 0);
-    const ist = nowIST();
-    const weekend = ist.getUTCDay() === 0 || ist.getUTCDay() === 6;
     const lastSession = formatDateIST(getPreviousSessionDate());
 
     const candleTasks = withQuotes.map(instrument => async () => {
       let raw: unknown[] = [];
       if (market.status === "CLOSED") {
-        // V3 permits up to one month for 1–15 minute historical candles.
-        // Fetch a full 30-day window so the 20 EMA is initialized from enough
-        // 5-minute closes instead of a short 5-day sample.
-        const from = dateDaysAgo(lastSession, 30);
+        // Keep the per-symbol request lightweight: five trading days provide
+        // enough 5-minute bars to seed EMA(20), ATR(14), and volume(20), while
+        // still allowing historical Pine V7 signal replay across recent sessions.
+        const from = dateDaysAgo(lastSession, 5);
         raw = await fetchHistoricalCandles(instrument.instrumentKey, token, from, lastSession).catch(() => []);
       } else {
         raw = await fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []);
