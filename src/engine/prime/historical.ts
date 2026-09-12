@@ -26,14 +26,6 @@ export interface HistoricalPrimeSignal {
 type SessionOHLC = { open: number; high: number; low: number; close: number };
 type LevelSet = { yh: number; yl: number; r1: number; r2: number; r3: number; s1: number; s2: number; s3: number };
 
-type IndicatorState = {
-  ema: number | null;
-  prevEma: number | null;
-  atr: number | null;
-  prevClose: number | null;
-  trValues: number[];
-};
-
 const EMA_LEN = 20;
 const ATR_LEN = 14;
 const VOL_LEN = 20;
@@ -130,7 +122,7 @@ function nearestResistance(high: number, levels: LevelSet, tol: number): string 
   return null;
 }
 
-/** Replay exact Pine V7 setupBuy/setupSell logic and return the latest signal. */
+/** Replay Pine V7 setupBuy/setupSell logic and return the first qualifying signal of the latest session. */
 export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSignal | null {
   const candles = input.filter(isRegularSession).slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   if (candles.length < Math.max(EMA_LEN, ATR_LEN, VOL_LEN) + 2) return null;
@@ -144,6 +136,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
   }
   const dates = [...sessions.keys()].sort();
   if (dates.length < 2) return null;
+  const latestSessionDate = dates[dates.length - 1];
 
   const previousSession = new Map<string, SessionOHLC>();
   for (let i = 1; i < dates.length; i++) {
@@ -164,10 +157,12 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
   const volumes: number[] = [];
   const trValues: number[] = [];
   let latest: HistoricalPrimeSignal | null = null;
+  let firstSignalLatestSession: HistoricalPrimeSignal | null = null;
 
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
-    const session = previousSession.get(sessionKey(c));
+    const sessionDate = sessionKey(c);
+    const session = previousSession.get(sessionDate);
     const range = c.high - c.low;
     const tr = prevClose === null
       ? range
@@ -208,7 +203,6 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const emaShort = c.close < ema && emaFalling;
     const crossed = prevEma !== null && ((prevClose! <= prevEma && c.close > ema) || (prevClose! >= prevEma && c.close < ema));
     const emaChoppy = crossed && Math.abs(c.close - ema) < atr * LEVEL_TOL_ATR;
-    const isFirstCandle = istParts(c.timestamp).hour === 9 && istParts(c.timestamp).minute >= 15 && istParts(c.timestamp).minute < 20;
 
     const nearSupport = nearestSupport(c.low, levels, levelTol);
     const nearResistance = nearestResistance(c.high, levels, levelTol);
@@ -222,8 +216,8 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const sellRejection = !!nearResistance && strongBear && volConfirmed && emaShort && roomToSell;
     const sellBreakdown = (c.close < levels.yl || c.close < levels.s1 || c.close < levels.s2 || c.close < levels.s3) && strongBear && volConfirmed && emaShort && roomToSell;
 
-    const setupBuy = (buyBounce || buyBreakout) && !isFirstCandle && !emaChoppy;
-    const setupSell = (sellRejection || sellBreakdown) && !isFirstCandle && !emaChoppy;
+    const setupBuy = buyBounce || buyBreakout;
+    const setupSell = sellRejection || sellBreakdown;
 
     if (setupBuy || setupSell) {
       const direction = setupBuy ? "BUY" : "SELL";
@@ -235,7 +229,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
         ? Math.min(levels.yl, levels.s1, i > 0 ? candles[i - 1].low : c.low) - atr * SL_BUFFER_ATR
         : Math.max(levels.yh, levels.r1, i > 0 ? candles[i - 1].high : c.high) + atr * SL_BUFFER_ATR;
       const risk = Math.abs(c.close - sl);
-      latest = {
+      const signal: HistoricalPrimeSignal = {
         direction,
         setup,
         level,
@@ -249,10 +243,14 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
         sl: Number(sl.toFixed(2)),
         riskPerShare: Number(risk.toFixed(2)),
       };
+      latest = signal;
+      if (sessionDate === latestSessionDate && firstSignalLatestSession === null) {
+        firstSignalLatestSession = signal;
+      }
     }
 
     prevClose = c.close;
   }
 
-  return latest;
+  return firstSignalLatestSession ?? latest;
 }
