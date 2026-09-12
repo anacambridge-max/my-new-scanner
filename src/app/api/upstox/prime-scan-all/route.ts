@@ -6,17 +6,11 @@
  * Architecture:
  * 1. Load authenticated Upstox token (server-side only)
  * 2. Load NSE F&O universe
- * 3. Batch-fetch market quotes (LTP + OHLC)
- * 4. For top-ranked symbols, fetch 5-min candle data
+ * 3. Batch-fetch market quotes (with per-instrument fallback)
+ * 4. For quoted symbols, fetch 5-min candle data
  * 5. Build YH/YL from previous session data
  * 6. Run Prime scanner engine on each symbol
  * 7. Rank and return normalized rows
- *
- * Performance note:
- * - Market quotes are batched (single request for all symbols)
- * - Candle data is fetched only for symbols that have LTP data
- * - Candle fetches are parallelized with concurrency limiting
- * - This endpoint is designed so a persistent worker can later own the scanning
  *
  * SECURITY: Access token never returned to client.
  */
@@ -35,10 +29,21 @@ import type { RawCandle } from "@/engine/prime/candle";
 
 export const dynamic = "force-dynamic";
 
-// Concurrency limit for candle fetches (avoid rate limiting)
 const CANDLE_FETCH_CONCURRENCY = 5;
-// Maximum symbols to fetch candles for (top by quote activity)
+const QUOTE_FALLBACK_CONCURRENCY = 5;
 const MAX_CANDLE_SYMBOLS = 50;
+
+type Quote = {
+  last_price: number;
+  net_change?: number;
+  ohlc?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    prev_close?: number;
+  };
+};
 
 async function withConcurrency<T>(
   tasks: (() => Promise<T>)[],
@@ -58,9 +63,44 @@ async function withConcurrency<T>(
     }
   }
 
-  const workers = Array.from({ length: concurrency }, () => worker());
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * Upstox rejects a complete batch when even one instrument key is invalid.
+ * The static F&O list can contain stale/changed ISINs, so a single bad key
+ * must not make all 50 symbols appear as "INSUFFICIENT DATA".
+ */
+async function fetchQuotesResilient(
+  instrumentKeys: string[],
+  accessToken: string
+): Promise<Record<string, Quote>> {
+  if (instrumentKeys.length === 0) return {};
+
+  try {
+    return await fetchMarketQuotes(instrumentKeys, accessToken) as Record<string, Quote>;
+  } catch (batchError) {
+    console.warn(
+      "[prime-scan-all] Batch quote request failed; falling back to per-instrument quotes:",
+      batchError instanceof Error ? batchError.message : String(batchError)
+    );
+  }
+
+  const tasks = instrumentKeys.map((key) => async () => {
+    const result = await fetchMarketQuotes([key], accessToken) as Record<string, Quote>;
+    return { key, quote: result[key] ?? Object.values(result)[0] ?? null };
+  });
+
+  const results = await withConcurrency(tasks, QUOTE_FALLBACK_CONCURRENCY);
+  const quotes: Record<string, Quote> = {};
+
+  for (const result of results) {
+    if (result?.quote) quotes[result.key] = result.quote;
+  }
+
+  return quotes;
 }
 
 export async function GET() {
@@ -77,43 +117,26 @@ export async function GET() {
       marketStatus: market.status,
       upstoxConnected: false,
       rows: [],
-      error: "UPSTOX_DISCONNECTED",
+      error: "UPSTOX_DISCONNECTED_OR_EXPIRED",
     };
     return Response.json(response, { status: 401 });
   }
 
   try {
-    // ── Step 1: Batch-fetch market quotes for all F&O symbols ────────────────
+    // ── Step 1: Batch-fetch market quotes with safe fallback ─────────────────
     const allInstrumentKeys = universe.map((i) => i.instrumentKey);
+    const quoteResults = await fetchQuotesResilient(allInstrumentKeys, token);
 
-    // Upstox supports batched quotes — split into chunks of 500
-    const chunkSize = 500;
-    const quoteResults: Record<string, { last_price: number; net_change?: number; ohlc?: { open: number; high: number; low: number; close: number; prev_close?: number } }> = {};
-
-    for (let i = 0; i < allInstrumentKeys.length; i += chunkSize) {
-      const chunk = allInstrumentKeys.slice(i, i + chunkSize);
-      try {
-        const quotes = await fetchMarketQuotes(chunk, token);
-        Object.assign(quoteResults, quotes);
-      } catch {
-        // Partial failure — continue with available data
-      }
-    }
-
-    // ── Step 2: Determine previous session dates ──────────────────────────────
+    // ── Step 2: Determine previous session date ──────────────────────────────
     const prevDate = getPreviousSessionDate();
     const prevDateStr = formatDateIST(prevDate);
 
-    // ── Step 3: Select top symbols for candle analysis ───────────────────────
-    // Priority: symbols with LTP data, sorted by volume/activity proxy
+    // ── Step 3: Select symbols that actually returned market data ────────────
     const symbolsWithQuotes = universe.filter(
       (i) => quoteResults[i.instrumentKey]?.last_price > 0
     );
-
-    // Limit candle fetches
     const symbolsForCandles = symbolsWithQuotes.slice(0, MAX_CANDLE_SYMBOLS);
 
-    // ── Step 4: Fetch candles for selected symbols ────────────────────────────
     type CandleResult = {
       symbol: string;
       intraday: RawCandle[];
@@ -135,8 +158,12 @@ export async function GET() {
         fetchHistoricalCandles(instrument.instrumentKey, token, prevDateStr, prevDateStr).catch(() => []),
       ]);
 
-      const intradayCandles = [...(intradayRaw as unknown as (string | number)[][])].reverse().map(toCandle);
-      const prevCandles = [...(histRaw as unknown as (string | number)[][])].reverse().map(toCandle);
+      const intradayCandles = [...(intradayRaw as unknown as (string | number)[][])]
+        .reverse()
+        .map(toCandle);
+      const prevCandles = [...(histRaw as unknown as (string | number)[][])]
+        .reverse()
+        .map(toCandle);
 
       return {
         symbol: instrument.symbol,
@@ -146,22 +173,26 @@ export async function GET() {
     });
 
     const candleResults = await withConcurrency(candleTasks, CANDLE_FETCH_CONCURRENCY);
-
     const candleMap = new Map<string, CandleResult>();
     candleResults.forEach((r) => {
       if (r) candleMap.set(r.symbol, r);
     });
 
-    // ── Step 5: Run Prime scanner on each symbol ─────────────────────────────
+    // ── Step 4: Run Prime scanner on each symbol ─────────────────────────────
     const rows = universe.map((instrument) => {
       const quote = quoteResults[instrument.instrumentKey];
       const candleData = candleMap.get(instrument.symbol);
 
       const ltp = quote?.last_price ?? null;
-      const prevClose = quote?.ohlc?.prev_close ?? candleData?.prev?.[candleData.prev.length - 1]?.close ?? null;
+      const prevClose =
+        quote?.ohlc?.prev_close ??
+        candleData?.prev?.[candleData.prev.length - 1]?.close ??
+        quote?.ohlc?.close ??
+        null;
+
       const dayChangePct =
         ltp !== null && prevClose !== null && prevClose > 0
-          ? parseFloat(((ltp - prevClose) / prevClose) * 100 + "")
+          ? ((ltp - prevClose) / prevClose) * 100
           : null;
 
       const prevCandles = candleData?.prev ?? [];
@@ -185,7 +216,6 @@ export async function GET() {
       });
     });
 
-    // ── Step 6: Rank results ─────────────────────────────────────────────────
     const ranked = rankScanResults(rows);
 
     const response: PrimeScanResponse = {
@@ -195,6 +225,9 @@ export async function GET() {
       marketStatus: market.status,
       upstoxConnected: true,
       rows: ranked,
+      ...(symbolsWithQuotes.length === 0
+        ? { error: "UPSTOX_RETURNED_NO_QUOTES_FOR_UNIVERSE" }
+        : {}),
     };
 
     return Response.json(response);
