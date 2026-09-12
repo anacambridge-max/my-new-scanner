@@ -1,14 +1,9 @@
 /**
  * PRIME TECHNICAL MASTER – Historical Signal Engine
  *
- * Replays the confirmed Pine V7 setup rules over the available 5-minute
- * history so the dashboard can show a PRIME signal that happened earlier in
- * the session instead of comparing only the current candle.
- *
- * IMPORTANT: the opening 09:15–09:20 candle is eligible for PRIME HISTORY.
- * When that first candle closes exactly on a previous-day/pivot breakout or
- * breakdown level, TradingView-style level touches must count as a trigger;
- * using strict >/< here was pushing those signals to the next candle.
+ * Replays the Pine V7 setup rules over the available 5-minute history so the
+ * dashboard can show the first PRIME signal that actually qualified in the
+ * latest session, including the 09:15 opening candle when it qualifies.
  */
 
 import type { RawCandle } from "./candle";
@@ -52,9 +47,7 @@ function istParts(timestamp: string): { date: string; hour: number; minute: numb
   return { date: `${get("year")}-${get("month")}-${get("day")}`, hour: Number(get("hour")), minute: Number(get("minute")) };
 }
 
-function sessionKey(c: RawCandle): string {
-  return istParts(c.timestamp).date;
-}
+function sessionKey(c: RawCandle): string { return istParts(c.timestamp).date; }
 
 function isRegularSession(c: RawCandle): boolean {
   const { hour, minute } = istParts(c.timestamp);
@@ -65,8 +58,7 @@ function isRegularSession(c: RawCandle): boolean {
 function pivotLevels(prev: SessionOHLC): LevelSet {
   const pivot = (prev.high + prev.low + prev.close) / 3;
   return {
-    yh: prev.high,
-    yl: prev.low,
+    yh: prev.high, yl: prev.low,
     r1: 2 * pivot - prev.low,
     r2: pivot + (prev.high - prev.low),
     r3: prev.high + 2 * (pivot - prev.low),
@@ -127,7 +119,7 @@ function nearestResistance(high: number, levels: LevelSet, tol: number): string 
   return null;
 }
 
-/** Replay Pine V7 setup logic and return the first qualifying signal of the latest session. */
+/** Replay the Pine setup logic and return the first qualifying signal of the latest session. */
 export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSignal | null {
   const candles = input.filter(isRegularSession).slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   if (candles.length < Math.max(EMA_LEN, ATR_LEN, VOL_LEN) + 2) return null;
@@ -169,9 +161,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const sessionDate = sessionKey(c);
     const session = previousSession.get(sessionDate);
     const range = c.high - c.low;
-    const tr = prevClose === null
-      ? range
-      : Math.max(range, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+    const tr = prevClose === null ? range : Math.max(range, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
 
     trValues.push(tr);
     closes.push(c.close);
@@ -190,10 +180,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const levels = pivotLevels(session);
     const levelTol = atr * LEVEL_TOL_ATR;
     const volRatio = volumeRatio(volumes, c.volume);
-    if (volRatio === null) {
-      prevClose = c.close;
-      continue;
-    }
+    if (volRatio === null) { prevClose = c.close; continue; }
 
     const volStars = stars(volRatio);
     const volConfirmed = volStars >= 1;
@@ -216,28 +203,24 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const roomToBuy = (nextResAbove - c.close) > atr * ROOM_ATR;
     const roomToSell = (c.close - nextSupBelow) > atr * ROOM_ATR;
 
-    const buyBounce = !!nearSupport && strongBull && volConfirmed && emaLong && roomToBuy;
-    const buyBreakout = (c.close >= levels.yh || c.close >= levels.r1 || c.close >= levels.r2 || c.close >= levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy;
-    const sellRejection = !!nearResistance && strongBear && volConfirmed && emaShort && roomToSell;
-    const sellBreakdown = (c.close <= levels.yl || c.close <= levels.s1 || c.close <= levels.s2 || c.close <= levels.s3) && strongBear && volConfirmed && emaShort && roomToSell;
+    const buyBounce = !!nearSupport && strongBull && volConfirmed && emaLong && roomToBuy && !emaChoppy;
+    const buyBreakout = (c.close >= levels.yh || c.close >= levels.r1 || c.close >= levels.r2 || c.close >= levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy && !emaChoppy;
+    const sellRejection = !!nearResistance && strongBear && volConfirmed && emaShort && roomToSell && !emaChoppy;
+    const sellBreakdown = (c.close <= levels.yl || c.close <= levels.s1 || c.close <= levels.s2 || c.close <= levels.s3) && strongBear && volConfirmed && emaShort && roomToSell && !emaChoppy;
 
     const setupBuy = buyBounce || buyBreakout;
     const setupSell = sellRejection || sellBreakdown;
 
     if (setupBuy || setupSell) {
       const direction = setupBuy ? "BUY" : "SELL";
-      const setup = setupBuy
-        ? (buyBreakout ? "BREAKOUT" : "BOUNCE")
-        : (sellBreakdown ? "BREAKDOWN" : "REJECTION");
+      const setup = setupBuy ? (buyBreakout ? "BREAKOUT" : "BOUNCE") : (sellBreakdown ? "BREAKDOWN" : "REJECTION");
       const level = setup === "BOUNCE" ? (nearSupport ?? "SUPPORT") : setup === "REJECTION" ? (nearResistance ?? "RESISTANCE") : levelNameForBreakout(c, levels, direction);
       const sl = setupBuy
         ? Math.min(levels.yl, levels.s1, i > 0 ? candles[i - 1].low : c.low) - atr * SL_BUFFER_ATR
         : Math.max(levels.yh, levels.r1, i > 0 ? candles[i - 1].high : c.high) + atr * SL_BUFFER_ATR;
       const risk = Math.abs(c.close - sl);
       const signal: HistoricalPrimeSignal = {
-        direction,
-        setup,
-        level,
+        direction, setup, level,
         triggerPrice: Number(c.close.toFixed(2)),
         signalTimestamp: c.timestamp,
         ema20: Number(ema.toFixed(2)),
@@ -249,9 +232,7 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
         riskPerShare: Number(risk.toFixed(2)),
       };
       latest = signal;
-      if (sessionDate === latestSessionDate && firstSignalLatestSession === null) {
-        firstSignalLatestSession = signal;
-      }
+      if (sessionDate === latestSessionDate && firstSignalLatestSession === null) firstSignalLatestSession = signal;
     }
 
     prevClose = c.close;
