@@ -65,10 +65,7 @@ function upstoxHeaders(accessToken: string) {
   };
 }
 
-/**
- * Fetch historical 5-minute candles for an instrument.
- * Uses Upstox Historical Candle V3 because V2 does not support 5-minute candles.
- */
+/** Fetch historical 5-minute candles for one instrument. */
 export async function fetchHistoricalCandles(
   instrumentKey: string,
   accessToken: string,
@@ -77,7 +74,6 @@ export async function fetchHistoricalCandles(
 ): Promise<UpstoxHistoricalCandle[]> {
   const to = toDate || formatDateIST(new Date());
   const from = fromDate || formatDateIST(offsetDays(new Date(), -5));
-
   const encodedKey = encodeURIComponent(instrumentKey);
   const url = `${UPSTOX_V3_BASE}/historical-candle/${encodedKey}/minutes/5/${to}/${from}`;
 
@@ -89,11 +85,7 @@ export async function fetchHistoricalCandles(
   return response.data?.data?.candles || [];
 }
 
-/**
- * Fetch current-session 5-minute candles.
- * Primary path is Upstox Intraday Candle V3. If it is unavailable/empty,
- * use the V3 Historical Candle endpoint for the current trading day.
- */
+/** Fetch current-session 5-minute candles with a historical fallback. */
 export async function fetchIntradayCandles(
   instrumentKey: string,
   accessToken: string
@@ -116,26 +108,13 @@ export async function fetchIntradayCandles(
   }
 
   const today = formatDateIST(new Date());
-  const historical = await fetchHistoricalCandles(
-    instrumentKey,
-    accessToken,
-    today,
-    today
-  );
-
-  if (!Array.isArray(historical) || historical.length === 0) {
-    console.warn(`[Upstox] No 5m historical candles returned for ${instrumentKey}`);
-    return [];
-  }
-
-  return historical;
+  const historical = await fetchHistoricalCandles(instrumentKey, accessToken, today, today);
+  return Array.isArray(historical) ? historical : [];
 }
 
 /**
  * Fetch previous-session daily OHLC for a batch of instruments.
- * Upstox V3 supports a large batch (up to 500 keys) and returns prev_ohlc,
- * so the scanner does not need one historical request per stock just to
- * calculate previous-day high/low levels.
+ * Chunk the request so the encoded query string never becomes excessively long.
  */
 export async function fetchDailyOHLC(
   instrumentKeys: string[],
@@ -143,21 +122,26 @@ export async function fetchDailyOHLC(
 ): Promise<Record<string, UpstoxDailyOHLC>> {
   if (instrumentKeys.length === 0) return {};
 
-  const keysParam = instrumentKeys.join(",");
-  const url = `${UPSTOX_V3_BASE}/market-quote/ohlc?instrument_key=${encodeURIComponent(keysParam)}&interval=1d`;
+  const combined: Record<string, UpstoxDailyOHLC> = {};
+  const chunkSize = 50;
 
-  const response = await axios.get(url, {
-    headers: upstoxHeaders(accessToken),
-    timeout: 20000,
-  });
+  for (let i = 0; i < instrumentKeys.length; i += chunkSize) {
+    const chunk = instrumentKeys.slice(i, i + chunkSize);
+    const keysParam = chunk.join(",");
+    const url = `${UPSTOX_V3_BASE}/market-quote/ohlc?instrument_key=${encodeURIComponent(keysParam)}&interval=1d`;
 
-  return response.data?.data || {};
+    const response = await axios.get(url, {
+      headers: upstoxHeaders(accessToken),
+      timeout: 15000,
+    });
+
+    Object.assign(combined, response.data?.data || {});
+  }
+
+  return combined;
 }
 
-/**
- * Fetch full market quotes for a batch of instruments.
- * Upstox supports up to 500 instruments per request.
- */
+/** Fetch full market quotes for a batch of instruments. */
 export async function fetchMarketQuotes(
   instrumentKeys: string[],
   accessToken: string
@@ -175,10 +159,6 @@ export async function fetchMarketQuotes(
   return response.data?.data || {};
 }
 
-/**
- * Fetch LTP (Last Traded Price) for a batch of instruments.
- * Lighter than full quote.
- */
 export async function fetchLTP(
   instrumentKeys: string[],
   accessToken: string
