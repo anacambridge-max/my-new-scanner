@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+/* ─── Prime Technical Master Terminal Theme ──────────────────────────────── */
+
+:root {
+  /* Terminal dark palette */
+  --bg-base: #0a0e1a;
+  --bg-surface: #0f1525;
+  --bg-card: #131929;
+  --bg-card-hover: #192035;
+  --bg-header: #0c1120;
+  --border: #1e2a42;
+  --border-bright: #2a3a5e;
+
+  /* Text */
+  --text-primary: #e2e8f4;
+  --text-secondary: #8496b8;
+  --text-muted: #4a5878;
+  --text-dim: #2e3d5a;
+
+  /* Status colors */
+  --green: #00d084;
+  --green-dim: #00a86680;
+  --red: #ff4757;
+  --red-dim: #ff475780;
+  --amber: #ffa502;
+  --amber-dim: #ffa50280;
+  --blue: #3d8bff;
+  --blue-dim: #3d8bff40;
+  --purple: #a855f7;
+
+  /* State badge colors */
+  --state-watch: #ffa502;
+  --state-setup: #3d8bff;
+  --state-confirmed: #00d084;
+  --state-fake: #a855f7;
+  --state-invalid: #ff4757;
+  --state-notrade: #4a5878;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 14px;
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Table */
+.terminal-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.terminal-table th {
+  background: var(--bg-header);
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.terminal-table th:hover {
+  color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+.terminal-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 0.78rem;
+}
+
+.terminal-table tr:hover td {
+  background: var(--bg-card-hover);
+  cursor: pointer;
+}
+
+.terminal-table tr.selected td {
+  background: var(--bg-card-hover);
+  border-left: 2px solid var(--blue);
+}
+
+/* Skeleton loader */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-card) 25%,
+    var(--border) 50%,
+    var(--bg-card) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+/* Pulse animation for live indicator */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.pulse {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* Number formatting */
+.num-positive { color: var(--green); }
+.num-negative { color: var(--red); }
+.num-neutral { color: var(--text-secondary); }
