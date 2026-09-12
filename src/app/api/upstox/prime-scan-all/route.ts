@@ -3,7 +3,7 @@ import { getValidToken } from "@/lib/upstox/token";
 import { getFnOUniverse } from "@/lib/upstox/universe";
 import { fetchMarketQuotes, fetchIntradayCandles, fetchHistoricalCandles, fetchDailyOHLC } from "@/lib/upstox/api";
 import { scanInstrument, rankScanResults } from "@/engine/prime/scanner";
-import { getMarketStatus, formatDateIST, getPreviousSessionDate, nowIST } from "@/lib/market";
+import { getMarketStatus, formatDateIST, getPreviousSessionDate } from "@/lib/market";
 import type { PrimeScanResponse } from "@/domain/prime";
 import type { RawCandle } from "@/engine/prime/candle";
 
@@ -123,10 +123,10 @@ export async function GET() {
     const candleTasks = withQuotes.map(instrument => async () => {
       let raw: unknown[] = [];
       if (market.status === "CLOSED") {
-        // Keep the per-symbol request lightweight: five trading days provide
-        // enough 5-minute bars to seed EMA(20), ATR(14), and volume(20), while
-        // still allowing historical Pine V7 signal replay across recent sessions.
-        const from = dateDaysAgo(lastSession, 5);
+        // Use a full recent month so EMA(20) and ATR(14) are seeded from
+        // materially more history, matching TradingView/Pine more closely.
+        // Upstox supports up to one month for 5-minute historical candles.
+        const from = dateDaysAgo(lastSession, 30);
         raw = await fetchHistoricalCandles(instrument.instrumentKey, token, from, lastSession).catch(() => []);
       } else {
         raw = await fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []);
