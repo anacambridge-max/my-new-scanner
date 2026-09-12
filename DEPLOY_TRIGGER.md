@@ -1,3 +1,3 @@
 # Deployment Trigger
 
-Forced redeploy for the latest PRIME historical first-candle fix.
+Force redeploy after the PRIME historical first-candle and full-history fixes.
