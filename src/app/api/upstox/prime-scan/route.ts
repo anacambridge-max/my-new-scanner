@@ -23,7 +23,7 @@ export async function GET(req: NextRequest) {
     return Response.json({ error: "symbol is required" }, { status: 400 });
   }
 
-  const instrument = getFnOBySymbol(symbol);
+  const instrument = await getFnOBySymbol(symbol);
   if (!instrument) {
     return Response.json({ error: `Unknown F&O symbol: ${symbol}` }, { status: 404 });
   }
@@ -41,10 +41,8 @@ export async function GET(req: NextRequest) {
   const prevDateStr = formatDateIST(prevDate);
 
   try {
-    // Fetch intraday candles (today's 5-min)
     const intradayRaw = await fetchIntradayCandles(instrument.instrumentKey, token);
 
-    // Fetch historical candles (yesterday for YH/YL)
     const histRaw = await fetchHistoricalCandles(
       instrument.instrumentKey,
       token,
@@ -61,17 +59,12 @@ export async function GET(req: NextRequest) {
       volume: Number(c[5]),
     });
 
-    // Intraday candles: newest-first → reverse to oldest-first
     const intradayCandles: RawCandle[] = [...(intradayRaw as unknown as (string | number)[][])].reverse().map(toCandle);
-
-    // Previous session candles
     const prevCandles: RawCandle[] = [...(histRaw as unknown as (string | number)[][])].reverse().map(toCandle);
 
-    // Calculate YH/YL from previous session
     const prevHigh = prevCandles.length > 0 ? Math.max(...prevCandles.map(c => c.high)) : null;
     const prevLow = prevCandles.length > 0 ? Math.min(...prevCandles.map(c => c.low)) : null;
 
-    // Get quote for LTP/day change
     const quotes = await fetchMarketQuotes([instrument.instrumentKey], token);
     const quote = quotes[instrument.instrumentKey];
 
