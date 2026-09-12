@@ -1,7 +1,7 @@
 /**
  * PRIME TECHNICAL MASTER – Scanner Engine
  *
- * Current confirmation is aligned to the user's PRIME TECHNICAL MASTER — L1-L12 Pine.
+ * Confirmation is aligned to the user's PRIME TECHNICAL MASTER — L1-L12 Pine.
  * Historical replay uses the same confirmation rules in historical.ts.
  */
 import type { PrimeScanRow, PrimeScanState, PrimeDirection, PrimePipelineStage, StageResult, ReactionAnalysis, EMAAnalysis, VolumeAnalysis, CandleData, PrimeLevels } from "@/domain/prime";
@@ -18,6 +18,8 @@ const MIN_VOLUME_MULTIPLE = 1.5;
 const MIN_BODY_RATIO = 0.50;
 const MIN_CLOSE_LOCATION = 0.60;
 
+type PineConfirmation = { direction: PrimeDirection; confirmed: boolean; setup: "BREAKOUT" | "BREAKDOWN" | null };
+
 function istParts(timestamp: string) {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date(timestamp));
   const get = (type: string) => parts.find(p => p.type === type)?.value ?? "00";
@@ -25,16 +27,17 @@ function istParts(timestamp: string) {
 }
 function inScanWindow(timestamp: string) { const p = istParts(timestamp); const m = p.hour * 60 + p.minute; return m >= 555 && m < 600; }
 
-function pineConfirmation(candles: RawCandle[], yh: number, yl: number, ema20: number | null) {
-  if (candles.length < 2 || ema20 === null) return { direction: "NEUTRAL" as PrimeDirection, confirmed: false, setup: null as "BREAKOUT" | "BREAKDOWN" | null };
+function pineConfirmation(candles: RawCandle[], yh: number, yl: number, ema20: number | null): PineConfirmation {
+  if (candles.length < 2 || ema20 === null) return { direction: "NEUTRAL", confirmed: false, setup: null };
   const c = candles[candles.length - 1], prev = candles[candles.length - 2];
-  if (!inScanWindow(c.timestamp)) return { direction: "NEUTRAL" as PrimeDirection, confirmed: false, setup: null };
+  if (!inScanWindow(c.timestamp)) return { direction: "NEUTRAL", confirmed: false, setup: null };
   const range = c.high - c.low;
-  if (range <= 0) return { direction: "NEUTRAL" as PrimeDirection, confirmed: false, setup: null };
+  if (range <= 0) return { direction: "NEUTRAL", confirmed: false, setup: null };
   const bodyRatio = Math.abs(c.close - c.open) / range;
   const bullReaction = c.close > c.open && bodyRatio >= MIN_BODY_RATIO && (c.close - c.low) / range >= MIN_CLOSE_LOCATION;
   const bearReaction = c.close < c.open && bodyRatio >= MIN_BODY_RATIO && (c.high - c.close) / range >= MIN_CLOSE_LOCATION;
-  if (candles.length < 20) return { direction: "NEUTRAL" as PrimeDirection, confirmed: false, setup: null };
+  if (candles.length < 20) return { direction: "NEUTRAL", confirmed: false, setup: null };
+  // Pine ta.sma(volume, 20) includes the current candle.
   const volumeWindow = candles.slice(-20);
   const avgVol = volumeWindow.reduce((sum, x) => sum + x.volume, 0) / volumeWindow.length;
   const volumePass = avgVol > 0 && c.volume / avgVol >= MIN_VOLUME_MULTIPLE;
@@ -113,9 +116,9 @@ export function scanInstrument(input: ScanInput): PrimeScanRow {
   let fakeBreakout = false;
   if (levels && candles5m.length >= 2) { const candleHistory = candles5m.map(c => analyseCandle(c)); fakeBreakout = detectFakeBreakout(candleHistory, levels.yh, "UP").detected || detectFakeBreakout(candleHistory, levels.yl, "DOWN").detected; }
   const location = levels && ltp !== null ? determinePriceLocation(ltp, levels) : "INSUFFICIENT_DATA";
-  const pine = levels && candles5m.length >= 2 ? pineConfirmation(candles5m, levels.yh, levels.yl, ema?.ema20 ?? null) : { direction: "NEUTRAL" as PrimeDirection, confirmed: false, setup: null as "BREAKOUT" | "BREAKDOWN" | null };
+  const pine: PineConfirmation = levels && candles5m.length >= 2 ? pineConfirmation(candles5m, levels.yh, levels.yl, ema?.ema20 ?? null) : { direction: "NEUTRAL", confirmed: false, setup: null };
   const state = determineState(hasLevels, reaction, candle, volume, ema, fakeBreakout, ltp, pine.confirmed);
-  const direction = pine.confirmed ? pine.direction : reaction.direction;
+  const direction: PrimeDirection = pine.confirmed ? pine.direction : reaction.direction;
   const pipeline = buildPipeline(hasLevels, reaction, candle, volume, ema, pine.confirmed); pipeline.push(safeHistoricalDetail(candles5m));
   const { score, note: scoreNote } = calculateScore(state, direction, volume, ema, candle, location);
   const reason = buildReason(reaction, volume, ema, state);
