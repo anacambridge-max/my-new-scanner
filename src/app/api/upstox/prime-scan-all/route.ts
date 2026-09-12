@@ -69,18 +69,45 @@ async function withConcurrency<T>(
 }
 
 /**
- * Upstox rejects a complete batch when even one instrument key is invalid.
- * The static F&O list can contain stale/changed ISINs, so a single bad key
- * must not make all 50 symbols appear as "INSUFFICIENT DATA".
+ * Upstox may return quote data keyed by EXCHANGE:TRADING_SYMBOL (for example
+ * NSE_EQ:RELIANCE), even when the request used NSE_EQ|ISIN. Normalize the
+ * response back to our universe's instrument keys so the scanner can find it.
+ *
+ * The static F&O list can also contain stale keys, so if the batch request is
+ * rejected we retry each instrument independently.
  */
 async function fetchQuotesResilient(
-  instrumentKeys: string[],
+  instruments: { instrumentKey: string; symbol: string }[],
   accessToken: string
 ): Promise<Record<string, Quote>> {
-  if (instrumentKeys.length === 0) return {};
+  if (instruments.length === 0) return {};
+
+  const instrumentKeys = instruments.map((i) => i.instrumentKey);
+
+  const normalizeBatch = (result: Record<string, Quote>) => {
+    const normalized: Record<string, Quote> = {};
+
+    for (const instrument of instruments) {
+      const direct = result[instrument.instrumentKey];
+      const bySymbol =
+        result[`NSE_EQ:${instrument.symbol}`] ??
+        result[`NSE_EQ:${instrument.symbol.toUpperCase()}`];
+      const quote = direct ?? bySymbol;
+      if (quote) normalized[instrument.instrumentKey] = quote;
+    }
+
+    return normalized;
+  };
 
   try {
-    return await fetchMarketQuotes(instrumentKeys, accessToken) as Record<string, Quote>;
+    const batch = (await fetchMarketQuotes(instrumentKeys, accessToken)) as Record<string, Quote>;
+    const normalized = normalizeBatch(batch);
+
+    // A successful HTTP response with zero matched records should not be
+    // treated as a valid scan; retry individually to isolate stale keys.
+    if (Object.keys(normalized).length > 0) return normalized;
+
+    console.warn("[prime-scan-all] Batch quote response contained no matching records; retrying individually.");
   } catch (batchError) {
     console.warn(
       "[prime-scan-all] Batch quote request failed; falling back to per-instrument quotes:",
@@ -88,9 +115,14 @@ async function fetchQuotesResilient(
     );
   }
 
-  const tasks = instrumentKeys.map((key) => async () => {
-    const result = await fetchMarketQuotes([key], accessToken) as Record<string, Quote>;
-    return { key, quote: result[key] ?? Object.values(result)[0] ?? null };
+  const tasks = instruments.map((instrument) => async () => {
+    const result = (await fetchMarketQuotes([instrument.instrumentKey], accessToken)) as Record<string, Quote>;
+    const quote =
+      result[instrument.instrumentKey] ??
+      result[`NSE_EQ:${instrument.symbol}`] ??
+      Object.values(result)[0] ??
+      null;
+    return { key: instrument.instrumentKey, quote };
   });
 
   const results = await withConcurrency(tasks, QUOTE_FALLBACK_CONCURRENCY);
@@ -124,8 +156,10 @@ export async function GET() {
 
   try {
     // ── Step 1: Batch-fetch market quotes with safe fallback ─────────────────
-    const allInstrumentKeys = universe.map((i) => i.instrumentKey);
-    const quoteResults = await fetchQuotesResilient(allInstrumentKeys, token);
+    const quoteResults = await fetchQuotesResilient(
+      universe.map((i) => ({ instrumentKey: i.instrumentKey, symbol: i.symbol })),
+      token
+    );
 
     // ── Step 2: Determine previous session date ──────────────────────────────
     const prevDate = getPreviousSessionDate();
