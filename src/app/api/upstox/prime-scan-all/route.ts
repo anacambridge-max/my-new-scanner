@@ -1,13 +1,8 @@
-/** GET /api/upstox/prime-scan-all */
+/* GET /api/upstox/prime-scan-all */
 
 import { getValidToken } from "@/lib/upstox/token";
 import { getFnOUniverse } from "@/lib/upstox/universe";
-import {
-  fetchMarketQuotes,
-  fetchIntradayCandles,
-  fetchHistoricalCandles,
-  fetchDailyOHLC,
-} from "@/lib/upstox/api";
+import { fetchMarketQuotes, fetchIntradayCandles, fetchHistoricalCandles, fetchDailyOHLC } from "@/lib/upstox/api";
 import { scanInstrument, rankScanResults } from "@/engine/prime/scanner";
 import { getMarketStatus, formatDateIST, getPreviousSessionDate, nowIST } from "@/lib/market";
 import type { PrimeScanResponse } from "@/domain/prime";
@@ -16,7 +11,9 @@ import type { RawCandle } from "@/engine/prime/candle";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const CANDLE_FETCH_CONCURRENCY = 20;
+// Keep request starts below Upstox's 50 req/sec standard-API ceiling while
+// allowing a 210-stock scan to finish within the serverless time budget.
+const CANDLE_FETCH_CONCURRENCY = 40;
 const QUOTE_FALLBACK_CONCURRENCY = 12;
 
 type Quote = {
@@ -51,10 +48,7 @@ async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: numb
   return results;
 }
 
-function normalizeByInstrumentKey<T extends { instrument_token?: string; symbol?: string }>(
-  requestedKeys: string[],
-  response: Record<string, T>
-): Record<string, T> {
+function normalizeByInstrumentKey<T extends { instrument_token?: string; symbol?: string }>(requestedKeys: string[], response: Record<string, T>): Record<string, T> {
   const normalized: Record<string, T> = {};
   const entries = Object.entries(response || {});
   for (const requested of requestedKeys) {
@@ -98,12 +92,7 @@ export async function GET() {
   const generatedAt = new Date().toISOString();
 
   if (!token) {
-    const response: PrimeScanResponse = {
-      universeCount: universe.length, scanCount: 0, generatedAt,
-      marketStatus: market.status, upstoxConnected: false, rows: [],
-      error: "UPSTOX_DISCONNECTED_OR_EXPIRED",
-    };
-    return Response.json(response, { status: 401 });
+    return Response.json({ universeCount: universe.length, scanCount: 0, generatedAt, marketStatus: market.status, upstoxConnected: false, rows: [], error: "UPSTOX_DISCONNECTED_OR_EXPIRED" } satisfies PrimeScanResponse, { status: 401 });
   }
 
   try {
@@ -120,16 +109,13 @@ export async function GET() {
 
     const symbolsWithQuotes = universe.filter((i) => Number(quoteResults[i.instrumentKey]?.last_price) > 0);
 
-    // IMPORTANT: Saturday/Sunday have no "today" candles. Use the last NSE
-    // session directly, otherwise every 5m candle becomes empty on weekends.
+    // Sep 12, 2026 is Saturday. On weekends/holidays there is no "today"
+    // 5-minute session, so use the last actual NSE session for the candle.
     const ist = nowIST();
     const isWeekend = ist.getUTCDay() === 0 || ist.getUTCDay() === 6;
     const sessionDate = isWeekend ? formatDateIST(getPreviousSessionDate()) : formatDateIST(new Date());
 
-    const toCandle = (c: (string | number)[]): RawCandle => ({
-      timestamp: String(c[0]), open: Number(c[1]), high: Number(c[2]),
-      low: Number(c[3]), close: Number(c[4]), volume: Number(c[5]),
-    });
+    const toCandle = (c: (string | number)[]): RawCandle => ({ timestamp: String(c[0]), open: Number(c[1]), high: Number(c[2]), low: Number(c[3]), close: Number(c[4]), volume: Number(c[5]) });
 
     const candleTasks = symbolsWithQuotes.map((instrument) => async () => {
       let raw: unknown[] = [];
@@ -138,10 +124,7 @@ export async function GET() {
       } else {
         raw = await fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []);
       }
-      return {
-        symbol: instrument.symbol,
-        intraday: [...(raw as (string | number)[][])].reverse().map(toCandle),
-      };
+      return { symbol: instrument.symbol, intraday: [...(raw as (string | number)[][])].reverse().map(toCandle) };
     });
 
     const candleResults = await withConcurrency(candleTasks, CANDLE_FETCH_CONCURRENCY);
@@ -167,7 +150,6 @@ export async function GET() {
         dayChangePct: dayChangePct !== null ? parseFloat(dayChangePct.toFixed(2)) : null,
         open: quote?.ohlc?.open ?? daily?.live_ohlc?.open ?? null,
         prevClose,
-        // These are true previous-session levels from OHLC V3.
         prevHigh: daily?.prev_ohlc?.high ?? null,
         prevLow: daily?.prev_ohlc?.low ?? null,
         candles5m: candles,
@@ -175,22 +157,10 @@ export async function GET() {
     });
 
     const ranked = rankScanResults(rows);
-    const response: PrimeScanResponse = {
-      universeCount: universe.length,
-      scanCount: ranked.length,
-      generatedAt,
-      marketStatus: market.status,
-      upstoxConnected: true,
-      rows: ranked,
-      ...(symbolsWithQuotes.length === 0 ? { error: "UPSTOX_RETURNED_NO_QUOTES_FOR_UNIVERSE" } : {}),
-    };
-    return Response.json(response);
+    return Response.json({ universeCount: universe.length, scanCount: ranked.length, generatedAt, marketStatus: market.status, upstoxConnected: true, rows: ranked, ...(symbolsWithQuotes.length === 0 ? { error: "UPSTOX_RETURNED_NO_QUOTES_FOR_UNIVERSE" } : {}) } satisfies PrimeScanResponse);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[prime-scan-all] Error:", message);
-    return Response.json({
-      universeCount: universe.length, scanCount: 0, generatedAt,
-      marketStatus: market.status, upstoxConnected: true, rows: [], error: message,
-    } satisfies PrimeScanResponse, { status: 500 });
+    return Response.json({ universeCount: universe.length, scanCount: 0, generatedAt, marketStatus: market.status, upstoxConnected: true, rows: [], error: message } satisfies PrimeScanResponse, { status: 500 });
   }
 }
