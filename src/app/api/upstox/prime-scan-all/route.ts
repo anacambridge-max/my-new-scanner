@@ -33,7 +33,13 @@ type DailyOHLC = {
 async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<(T | null)[]> {
   const results: (T | null)[] = new Array(tasks.length).fill(null);
   let idx = 0;
-  async function worker() { while (idx < tasks.length) { const current = idx++; try { results[current] = await tasks[current](); } catch { results[current] = null; } } }
+  async function worker() {
+    while (idx < tasks.length) {
+      const current = idx++;
+      try { results[current] = await tasks[current](); }
+      catch { results[current] = null; }
+    }
+  }
   await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
   return results;
 }
@@ -72,6 +78,31 @@ async function fetchQuotesResilient(keys: string[], token: string): Promise<Reco
   return out;
 }
 
+function dateDaysAgo(dateString: string, days: number): string {
+  const d = new Date(`${dateString}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  return formatDateIST(d);
+}
+
+function toRawCandle(c: (string | number)[]): RawCandle {
+  return {
+    timestamp: String(c[0]),
+    open: Number(c[1]),
+    high: Number(c[2]),
+    low: Number(c[3]),
+    close: Number(c[4]),
+    volume: Number(c[5]),
+  };
+}
+
+function normalizeCandleOrder(raw: unknown[]): RawCandle[] {
+  return (raw as (string | number)[][])
+    .filter(c => Array.isArray(c) && c.length >= 6)
+    .map(toRawCandle)
+    .filter(c => Number.isFinite(c.close) && c.close > 0)
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+}
+
 export async function GET() {
   const token = await getValidToken();
   const market = getMarketStatus();
@@ -90,19 +121,19 @@ export async function GET() {
     const ist = nowIST();
     const weekend = ist.getUTCDay() === 0 || ist.getUTCDay() === 6;
     const lastSession = formatDateIST(getPreviousSessionDate());
-    // For closed/weekend scans, request a 5-day window ending at the last
-    // session instead of a single date. This is more robust around holidays
-    // and guarantees EMA/volume have enough 5m observations.
-    const toCandle = (c: (string | number)[]): RawCandle => ({ timestamp: String(c[0]), open: Number(c[1]), high: Number(c[2]), low: Number(c[3]), close: Number(c[4]), volume: Number(c[5]) });
+
     const candleTasks = withQuotes.map(instrument => async () => {
       let raw: unknown[] = [];
       if (market.status === "CLOSED") {
-        const from = formatDateIST(new Date(new Date(lastSession + "T00:00:00Z").getTime() - 5 * 86400000));
+        // V3 permits up to one month for 1–15 minute historical candles.
+        // Fetch a full 30-day window so the 20 EMA is initialized from enough
+        // 5-minute closes instead of a short 5-day sample.
+        const from = dateDaysAgo(lastSession, 30);
         raw = await fetchHistoricalCandles(instrument.instrumentKey, token, from, lastSession).catch(() => []);
       } else {
         raw = await fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []);
       }
-      return { symbol: instrument.symbol, intraday: [...(raw as (string | number)[][])].reverse().map(toCandle) };
+      return { symbol: instrument.symbol, intraday: normalizeCandleOrder(raw) };
     });
     const candleResults = await withConcurrency(candleTasks, CANDLE_FETCH_CONCURRENCY);
     const candleMap = new Map<string, { symbol: string; intraday: RawCandle[] }>();
@@ -115,8 +146,6 @@ export async function GET() {
       const ltp = q?.last_price ?? null;
       const prevClose = q?.prev_close_price ?? q?.ohlc?.prev_close ?? d?.prev_ohlc?.close ?? q?.ohlc?.close ?? null;
       const dayChangePct = ltp !== null && prevClose !== null && prevClose > 0 ? ((ltp - prevClose) / prevClose) * 100 : null;
-      // Primary = previous trading session from OHLC V3. Fallback = the
-      // closed-session OHLC snapshot from Full Quotes V3.
       const prevHigh = d?.prev_ohlc?.high ?? (market.status === "CLOSED" ? q?.ohlc?.high : null) ?? null;
       const prevLow = d?.prev_ohlc?.low ?? (market.status === "CLOSED" ? q?.ohlc?.low : null) ?? null;
       return scanInstrument({
