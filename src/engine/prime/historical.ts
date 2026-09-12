@@ -2,8 +2,13 @@
  * PRIME TECHNICAL MASTER – Historical Signal Engine
  *
  * Replays the confirmed Pine V7 setup rules over the available 5-minute
- * history so the dashboard can show a PRIME signal that happened earlier
- * in the session instead of comparing only the current candle.
+ * history so the dashboard can show a PRIME signal that happened earlier in
+ * the session instead of comparing only the current candle.
+ *
+ * IMPORTANT: the opening 09:15–09:20 candle is eligible for PRIME HISTORY.
+ * When that first candle closes exactly on a previous-day/pivot breakout or
+ * breakdown level, TradingView-style level touches must count as a trigger;
+ * using strict >/< here was pushing those signals to the next candle.
  */
 
 import type { RawCandle } from "./candle";
@@ -99,14 +104,14 @@ function stars(ratio: number): 1 | 2 | 3 | 0 {
 
 function levelNameForBreakout(c: RawCandle, levels: LevelSet, direction: "BUY" | "SELL"): string {
   if (direction === "BUY") {
-    if (c.close > levels.r3) return "R3";
-    if (c.close > levels.r2) return "R2";
-    if (c.close > levels.r1) return "R1";
+    if (c.close >= levels.r3) return "R3";
+    if (c.close >= levels.r2) return "R2";
+    if (c.close >= levels.r1) return "R1";
     return "YH";
   }
-  if (c.close < levels.s3) return "S3";
-  if (c.close < levels.s2) return "S2";
-  if (c.close < levels.s1) return "S1";
+  if (c.close <= levels.s3) return "S3";
+  if (c.close <= levels.s2) return "S2";
+  if (c.close <= levels.s1) return "S1";
   return "YL";
 }
 
@@ -122,7 +127,7 @@ function nearestResistance(high: number, levels: LevelSet, tol: number): string 
   return null;
 }
 
-/** Replay Pine V7 setupBuy/setupSell logic and return the first qualifying signal of the latest session. */
+/** Replay Pine V7 setup logic and return the first qualifying signal of the latest session. */
 export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSignal | null {
   const candles = input.filter(isRegularSession).slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   if (candles.length < Math.max(EMA_LEN, ATR_LEN, VOL_LEN) + 2) return null;
@@ -212,9 +217,9 @@ export function findHistoricalPrimeSignal(input: RawCandle[]): HistoricalPrimeSi
     const roomToSell = (c.close - nextSupBelow) > atr * ROOM_ATR;
 
     const buyBounce = !!nearSupport && strongBull && volConfirmed && emaLong && roomToBuy;
-    const buyBreakout = (c.close > levels.yh || c.close > levels.r1 || c.close > levels.r2 || c.close > levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy;
+    const buyBreakout = (c.close >= levels.yh || c.close >= levels.r1 || c.close >= levels.r2 || c.close >= levels.r3) && strongBull && volConfirmed && emaLong && roomToBuy;
     const sellRejection = !!nearResistance && strongBear && volConfirmed && emaShort && roomToSell;
-    const sellBreakdown = (c.close < levels.yl || c.close < levels.s1 || c.close < levels.s2 || c.close < levels.s3) && strongBear && volConfirmed && emaShort && roomToSell;
+    const sellBreakdown = (c.close <= levels.yl || c.close <= levels.s1 || c.close <= levels.s2 || c.close <= levels.s3) && strongBear && volConfirmed && emaShort && roomToSell;
 
     const setupBuy = buyBounce || buyBreakout;
     const setupSell = sellRejection || sellBreakdown;
