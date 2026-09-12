@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
     return Response.json({ error: "symbol is required" }, { status: 400 });
   }
 
-  const instrument = getFnOBySymbol(symbol);
+  const instrument = await getFnOBySymbol(symbol);
   if (!instrument) {
     return Response.json({ error: `Unknown F&O symbol: ${symbol}` }, { status: 404 });
   }
@@ -46,8 +46,6 @@ export async function GET(req: NextRequest) {
       rawCandles = (await fetchHistoricalCandles(instrument.instrumentKey, token, from, to)) as unknown as (string | number)[][];
     }
 
-    // Upstox returns candles as arrays: [timestamp, open, high, low, close, volume, oi]
-    // They come newest-first; reverse to oldest-first for engine
     const candles: RawCandle[] = [...rawCandles]
       .reverse()
       .map((c) => ({
