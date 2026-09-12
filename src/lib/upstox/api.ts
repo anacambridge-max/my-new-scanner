@@ -8,6 +8,7 @@
 import axios from "axios";
 
 const UPSTOX_BASE = "https://api.upstox.com/v2";
+const UPSTOX_V3_BASE = "https://api.upstox.com/v3";
 
 export interface UpstoxHistoricalCandle {
   // [timestamp, open, high, low, close, volume, oi]
@@ -31,6 +32,8 @@ export interface UpstoxQuote {
     prev_close?: number;
   };
   volume?: number;
+  year_high?: number;
+  year_low?: number;
 }
 
 function upstoxHeaders(accessToken: string) {
@@ -43,6 +46,7 @@ function upstoxHeaders(accessToken: string) {
 
 /**
  * Fetch historical 5-minute candles for an instrument.
+ * Uses Upstox Historical Candle V3 because V2 does not support 5-minute candles.
  */
 export async function fetchHistoricalCandles(
   instrumentKey: string,
@@ -53,10 +57,8 @@ export async function fetchHistoricalCandles(
   const to = toDate || formatDate(new Date());
   const from = fromDate || formatDate(offsetDays(new Date(), -5));
 
-  // URL encode the instrument key
   const encodedKey = encodeURIComponent(instrumentKey);
-
-  const url = `${UPSTOX_BASE}/historical-candle/${encodedKey}/5minute/${to}/${from}`;
+  const url = `${UPSTOX_V3_BASE}/historical-candle/${encodedKey}/minutes/5/${to}/${from}`;
 
   const response = await axios.get(url, {
     headers: upstoxHeaders(accessToken),
@@ -68,13 +70,14 @@ export async function fetchHistoricalCandles(
 
 /**
  * Fetch intraday 5-minute candles (today's session).
+ * Uses Upstox Intraday Candle V3 because V2 does not support 5-minute candles.
  */
 export async function fetchIntradayCandles(
   instrumentKey: string,
   accessToken: string
 ): Promise<UpstoxHistoricalCandle[]> {
   const encodedKey = encodeURIComponent(instrumentKey);
-  const url = `${UPSTOX_BASE}/historical-candle/intraday/${encodedKey}/5minute`;
+  const url = `${UPSTOX_V3_BASE}/historical-candle/intraday/${encodedKey}/minutes/5`;
 
   const response = await axios.get(url, {
     headers: upstoxHeaders(accessToken),
@@ -86,7 +89,7 @@ export async function fetchIntradayCandles(
 
 /**
  * Fetch full market quotes for a batch of instruments.
- * Upstox supports up to ~500 instruments per request.
+ * Upstox supports up to 500 instruments per request.
  */
 export async function fetchMarketQuotes(
   instrumentKeys: string[],
