@@ -51,8 +51,8 @@ function upstoxHeaders(accessToken: string) {
 export async function fetchHistoricalCandles(
   instrumentKey: string,
   accessToken: string,
-  fromDate?: string, // YYYY-MM-DD
-  toDate?: string    // YYYY-MM-DD
+  fromDate?: string,
+  toDate?: string
 ): Promise<UpstoxHistoricalCandle[]> {
   const to = toDate || formatDate(new Date());
   const from = fromDate || formatDate(offsetDays(new Date(), -5));
@@ -69,22 +69,34 @@ export async function fetchHistoricalCandles(
 }
 
 /**
- * Fetch intraday 5-minute candles (today's session).
- * Uses Upstox Intraday Candle V3 because V2 does not support 5-minute candles.
+ * Fetch current-session 5-minute candles.
+ * Primary path is Upstox Intraday Candle V3. If that endpoint returns an
+ * error/empty payload, fall back to Historical Candle V3 for today's date.
+ * This is important after market close, when intraday availability can vary.
  */
 export async function fetchIntradayCandles(
   instrumentKey: string,
   accessToken: string
 ): Promise<UpstoxHistoricalCandle[]> {
   const encodedKey = encodeURIComponent(instrumentKey);
-  const url = `${UPSTOX_V3_BASE}/historical-candle/intraday/${encodedKey}/minutes/5`;
+  const intradayUrl = `${UPSTOX_V3_BASE}/historical-candle/intraday/${encodedKey}/minutes/5`;
 
-  const response = await axios.get(url, {
-    headers: upstoxHeaders(accessToken),
-    timeout: 15000,
-  });
+  try {
+    const response = await axios.get(intradayUrl, {
+      headers: upstoxHeaders(accessToken),
+      timeout: 15000,
+    });
+    const candles = response.data?.data?.candles || [];
+    if (Array.isArray(candles) && candles.length > 0) return candles;
+  } catch (error) {
+    console.warn(
+      `[Upstox] Intraday V3 failed for ${instrumentKey}; trying historical V3 fallback:`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
 
-  return response.data?.data?.candles || [];
+  const today = formatDate(new Date());
+  return fetchHistoricalCandles(instrumentKey, accessToken, today, today);
 }
 
 /**
@@ -129,9 +141,6 @@ export async function fetchLTP(
   return response.data?.data || {};
 }
 
-/**
- * Get user profile to verify token validity.
- */
 export async function fetchUserProfile(
   accessToken: string
 ): Promise<Record<string, unknown>> {
@@ -143,9 +152,6 @@ export async function fetchUserProfile(
   return response.data?.data || {};
 }
 
-/**
- * Exchange authorization code for access token.
- */
 export async function exchangeCodeForToken(
   code: string,
   clientId: string,
@@ -173,8 +179,6 @@ export async function exchangeCodeForToken(
   );
   return response.data;
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatDate(date: Date): string {
   return date.toISOString().split("T")[0];
