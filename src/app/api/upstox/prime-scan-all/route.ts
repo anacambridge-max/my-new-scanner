@@ -19,8 +19,11 @@ import type { RawCandle } from "@/engine/prime/candle";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const CANDLE_FETCH_CONCURRENCY = 12;
-const QUOTE_FALLBACK_CONCURRENCY = 8;
+// Upstox standard APIs allow up to 50 req/sec and 500 req/min.
+// Keep concurrency high enough for 210-stock scans, but avoid creating
+// hundreds of simultaneous requests that can timeout or be throttled.
+const CANDLE_FETCH_CONCURRENCY = 20;
+const QUOTE_FALLBACK_CONCURRENCY = 12;
 
 type Quote = {
   last_price: number;
@@ -58,11 +61,6 @@ async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: numb
   return results;
 }
 
-/**
- * Upstox accepts instrument keys using NSE_EQ|..., but the V2 full-quote
- * response is keyed as NSE_EQ:SYMBOL. It can also expose instrument_token.
- * Normalize all of those forms back to the exact requested instrument key.
- */
 function normalizeQuotes(
   requestedKeys: string[],
   response: Record<string, Quote>
@@ -151,6 +149,7 @@ export async function GET() {
     const quoteResults = await fetchQuotesResilient(allInstrumentKeys, token);
 
     const prevDateStr = formatDateIST(getPreviousSessionDate());
+    const todayDateStr = formatDateIST(new Date());
     const symbolsWithQuotes = universe.filter(
       (i) => Number(quoteResults[i.instrumentKey]?.last_price) > 0
     );
@@ -171,14 +170,22 @@ export async function GET() {
     });
 
     const candleTasks = symbolsWithQuotes.map((instrument) => async (): Promise<CandleResult> => {
-      const [intradayRaw, histRaw] = await Promise.all([
-        fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []),
+      // After market close, do NOT call Intraday + fallback for every stock.
+      // That can become 3 candle requests/stock (630 calls for 210 stocks)
+      // and cause throttling/timeouts. Historical V3 contains the completed
+      // day's 5-minute candles and is the correct source after close.
+      const sessionPromise = market.status === "CLOSED"
+        ? fetchHistoricalCandles(instrument.instrumentKey, token, todayDateStr, todayDateStr)
+        : fetchIntradayCandles(instrument.instrumentKey, token);
+
+      const [sessionRaw, histRaw] = await Promise.all([
+        sessionPromise.catch(() => []),
         fetchHistoricalCandles(instrument.instrumentKey, token, prevDateStr, prevDateStr).catch(() => []),
       ]);
 
       return {
         symbol: instrument.symbol,
-        intraday: [...(intradayRaw as unknown as (string | number)[][])].reverse().map(toCandle),
+        intraday: [...(sessionRaw as unknown as (string | number)[][])].reverse().map(toCandle),
         prev: [...(histRaw as unknown as (string | number)[][])].reverse().map(toCandle),
       };
     });
