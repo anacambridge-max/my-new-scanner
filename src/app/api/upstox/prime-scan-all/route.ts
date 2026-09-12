@@ -1,18 +1,7 @@
 /**
  * GET /api/upstox/prime-scan-all
  *
- * Aggregate NSE F&O scanner.
- *
- * Architecture:
- * 1. Load authenticated Upstox token (server-side only)
- * 2. Load NSE F&O universe
- * 3. Batch-fetch market quotes (with per-instrument fallback)
- * 4. For quoted symbols, fetch 5-min candle data
- * 5. Build YH/YL from previous session data
- * 6. Run Prime scanner engine on each symbol
- * 7. Rank and return normalized rows
- *
- * SECURITY: Access token never returned to client.
+ * Aggregate NSE F&O scanner using the live Upstox NSE instrument master.
  */
 
 import { getValidToken } from "@/lib/upstox/token";
@@ -28,14 +17,16 @@ import type { PrimeScanResponse } from "@/domain/prime";
 import type { RawCandle } from "@/engine/prime/candle";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
-const CANDLE_FETCH_CONCURRENCY = 5;
-const QUOTE_FALLBACK_CONCURRENCY = 5;
-const MAX_CANDLE_SYMBOLS = 50;
+const CANDLE_FETCH_CONCURRENCY = 12;
+const QUOTE_FALLBACK_CONCURRENCY = 8;
 
 type Quote = {
   last_price: number;
   net_change?: number;
+  instrument_token?: string;
+  symbol?: string;
   ohlc?: {
     open: number;
     high: number;
@@ -43,12 +34,10 @@ type Quote = {
     close: number;
     prev_close?: number;
   };
+  volume?: number;
 };
 
-async function withConcurrency<T>(
-  tasks: (() => Promise<T>)[],
-  concurrency: number
-): Promise<(T | null)[]> {
+async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<(T | null)[]> {
   const results: (T | null)[] = new Array(tasks.length).fill(null);
   let idx = 0;
 
@@ -63,82 +52,85 @@ async function withConcurrency<T>(
     }
   }
 
-  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
-  await Promise.all(workers);
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker())
+  );
   return results;
 }
 
 /**
- * Upstox may return quote data keyed by EXCHANGE:TRADING_SYMBOL (for example
- * NSE_EQ:RELIANCE), even when the request used NSE_EQ|ISIN. Normalize the
- * response back to our universe's instrument keys so the scanner can find it.
- *
- * The static F&O list can also contain stale keys, so if the batch request is
- * rejected we retry each instrument independently.
+ * Upstox accepts instrument keys using NSE_EQ|..., but the V2 full-quote
+ * response is keyed as NSE_EQ:SYMBOL. It can also expose instrument_token.
+ * Normalize all of those forms back to the exact requested instrument key.
  */
-async function fetchQuotesResilient(
-  instruments: { instrumentKey: string; symbol: string }[],
-  accessToken: string
-): Promise<Record<string, Quote>> {
-  if (instruments.length === 0) return {};
+function normalizeQuotes(
+  requestedKeys: string[],
+  response: Record<string, Quote>
+): Record<string, Quote> {
+  const normalized: Record<string, Quote> = {};
+  const entries = Object.entries(response || {});
 
-  const instrumentKeys = instruments.map((i) => i.instrumentKey);
-
-  const normalizeBatch = (result: Record<string, Quote>) => {
-    const normalized: Record<string, Quote> = {};
-
-    for (const instrument of instruments) {
-      const direct = result[instrument.instrumentKey];
-      const bySymbol =
-        result[`NSE_EQ:${instrument.symbol}`] ??
-        result[`NSE_EQ:${instrument.symbol.toUpperCase()}`];
-      const quote = direct ?? bySymbol;
-      if (quote) normalized[instrument.instrumentKey] = quote;
+  for (const requested of requestedKeys) {
+    const direct = response?.[requested];
+    if (direct) {
+      normalized[requested] = direct;
+      continue;
     }
 
-    return normalized;
-  };
+    const colonKey = requested.replace("|", ":");
+    const byColon = response?.[colonKey];
+    if (byColon) {
+      normalized[requested] = byColon;
+      continue;
+    }
+
+    const byToken = entries.find(([, quote]) => quote?.instrument_token === requested);
+    if (byToken?.[1]) {
+      normalized[requested] = byToken[1];
+      continue;
+    }
+
+    const requestedSymbol = requested.split("|")[1];
+    const bySymbol = entries.find(([, quote]) => quote?.symbol === requestedSymbol);
+    if (bySymbol?.[1]) normalized[requested] = bySymbol[1];
+  }
+
+  return normalized;
+}
+
+async function fetchQuotesResilient(instrumentKeys: string[], accessToken: string): Promise<Record<string, Quote>> {
+  if (instrumentKeys.length === 0) return {};
 
   try {
-    const batch = (await fetchMarketQuotes(instrumentKeys, accessToken)) as Record<string, Quote>;
-    const normalized = normalizeBatch(batch);
-
-    // A successful HTTP response with zero matched records should not be
-    // treated as a valid scan; retry individually to isolate stale keys.
+    const raw = await fetchMarketQuotes(instrumentKeys, accessToken) as Record<string, Quote>;
+    const normalized = normalizeQuotes(instrumentKeys, raw);
     if (Object.keys(normalized).length > 0) return normalized;
-
-    console.warn("[prime-scan-all] Batch quote response contained no matching records; retrying individually.");
-  } catch (batchError) {
+    console.warn("[prime-scan-all] Batch quote response contained no mappable instruments");
+  } catch (error) {
     console.warn(
       "[prime-scan-all] Batch quote request failed; falling back to per-instrument quotes:",
-      batchError instanceof Error ? batchError.message : String(batchError)
+      error instanceof Error ? error.message : String(error)
     );
   }
 
-  const tasks = instruments.map((instrument) => async () => {
-    const result = (await fetchMarketQuotes([instrument.instrumentKey], accessToken)) as Record<string, Quote>;
-    const quote =
-      result[instrument.instrumentKey] ??
-      result[`NSE_EQ:${instrument.symbol}`] ??
-      Object.values(result)[0] ??
-      null;
-    return { key: instrument.instrumentKey, quote };
+  const tasks = instrumentKeys.map((key) => async () => {
+    const raw = await fetchMarketQuotes([key], accessToken) as Record<string, Quote>;
+    const normalized = normalizeQuotes([key], raw);
+    return { key, quote: normalized[key] ?? Object.values(raw || {})[0] ?? null };
   });
 
   const results = await withConcurrency(tasks, QUOTE_FALLBACK_CONCURRENCY);
   const quotes: Record<string, Quote> = {};
-
   for (const result of results) {
     if (result?.quote) quotes[result.key] = result.quote;
   }
-
   return quotes;
 }
 
 export async function GET() {
   const token = await getValidToken();
   const market = getMarketStatus();
-  const universe = getFnOUniverse();
+  const universe = await getFnOUniverse();
   const generatedAt = new Date().toISOString();
 
   if (!token) {
@@ -155,21 +147,13 @@ export async function GET() {
   }
 
   try {
-    // ── Step 1: Batch-fetch market quotes with safe fallback ─────────────────
-    const quoteResults = await fetchQuotesResilient(
-      universe.map((i) => ({ instrumentKey: i.instrumentKey, symbol: i.symbol })),
-      token
-    );
+    const allInstrumentKeys = universe.map((i) => i.instrumentKey);
+    const quoteResults = await fetchQuotesResilient(allInstrumentKeys, token);
 
-    // ── Step 2: Determine previous session date ──────────────────────────────
-    const prevDate = getPreviousSessionDate();
-    const prevDateStr = formatDateIST(prevDate);
-
-    // ── Step 3: Select symbols that actually returned market data ────────────
+    const prevDateStr = formatDateIST(getPreviousSessionDate());
     const symbolsWithQuotes = universe.filter(
-      (i) => quoteResults[i.instrumentKey]?.last_price > 0
+      (i) => Number(quoteResults[i.instrumentKey]?.last_price) > 0
     );
-    const symbolsForCandles = symbolsWithQuotes.slice(0, MAX_CANDLE_SYMBOLS);
 
     type CandleResult = {
       symbol: string;
@@ -186,23 +170,16 @@ export async function GET() {
       volume: Number(c[5]),
     });
 
-    const candleTasks = symbolsForCandles.map((instrument) => async (): Promise<CandleResult> => {
+    const candleTasks = symbolsWithQuotes.map((instrument) => async (): Promise<CandleResult> => {
       const [intradayRaw, histRaw] = await Promise.all([
         fetchIntradayCandles(instrument.instrumentKey, token).catch(() => []),
         fetchHistoricalCandles(instrument.instrumentKey, token, prevDateStr, prevDateStr).catch(() => []),
       ]);
 
-      const intradayCandles = [...(intradayRaw as unknown as (string | number)[][])]
-        .reverse()
-        .map(toCandle);
-      const prevCandles = [...(histRaw as unknown as (string | number)[][])]
-        .reverse()
-        .map(toCandle);
-
       return {
         symbol: instrument.symbol,
-        intraday: intradayCandles,
-        prev: prevCandles,
+        intraday: [...(intradayRaw as unknown as (string | number)[][])].reverse().map(toCandle),
+        prev: [...(histRaw as unknown as (string | number)[][])].reverse().map(toCandle),
       };
     });
 
@@ -212,11 +189,9 @@ export async function GET() {
       if (r) candleMap.set(r.symbol, r);
     });
 
-    // ── Step 4: Run Prime scanner on each symbol ─────────────────────────────
     const rows = universe.map((instrument) => {
       const quote = quoteResults[instrument.instrumentKey];
       const candleData = candleMap.get(instrument.symbol);
-
       const ltp = quote?.last_price ?? null;
       const prevClose =
         quote?.ohlc?.prev_close ??
@@ -230,8 +205,8 @@ export async function GET() {
           : null;
 
       const prevCandles = candleData?.prev ?? [];
-      const prevHigh = prevCandles.length > 0 ? Math.max(...prevCandles.map((c) => c.high)) : null;
-      const prevLow = prevCandles.length > 0 ? Math.min(...prevCandles.map((c) => c.low)) : null;
+      const prevHigh = prevCandles.length ? Math.max(...prevCandles.map((c) => c.high)) : null;
+      const prevLow = prevCandles.length ? Math.min(...prevCandles.map((c) => c.low)) : null;
 
       return scanInstrument({
         symbol: instrument.symbol,
@@ -251,7 +226,6 @@ export async function GET() {
     });
 
     const ranked = rankScanResults(rows);
-
     const response: PrimeScanResponse = {
       universeCount: universe.length,
       scanCount: ranked.length,
@@ -259,16 +233,13 @@ export async function GET() {
       marketStatus: market.status,
       upstoxConnected: true,
       rows: ranked,
-      ...(symbolsWithQuotes.length === 0
-        ? { error: "UPSTOX_RETURNED_NO_QUOTES_FOR_UNIVERSE" }
-        : {}),
+      ...(symbolsWithQuotes.length === 0 ? { error: "UPSTOX_RETURNED_NO_QUOTES_FOR_UNIVERSE" } : {}),
     };
 
     return Response.json(response);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[prime-scan-all] Error:", message);
-
     const response: PrimeScanResponse = {
       universeCount: universe.length,
       scanCount: 0,
