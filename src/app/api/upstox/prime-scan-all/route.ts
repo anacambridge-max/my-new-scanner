@@ -10,9 +10,10 @@ import {
   fetchMarketQuotes,
   fetchIntradayCandles,
   fetchHistoricalCandles,
+  fetchDailyOHLC,
 } from "@/lib/upstox/api";
 import { scanInstrument, rankScanResults } from "@/engine/prime/scanner";
-import { getMarketStatus, formatDateIST, getPreviousSessionDate } from "@/lib/market";
+import { getMarketStatus, formatDateIST } from "@/lib/market";
 import type { PrimeScanResponse } from "@/domain/prime";
 import type { RawCandle } from "@/engine/prime/candle";
 
@@ -20,8 +21,8 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 // Upstox standard APIs allow up to 50 req/sec and 500 req/min.
-// Keep concurrency high enough for 210-stock scans, but avoid creating
-// hundreds of simultaneous requests that can timeout or be throttled.
+// One batch quote + one batch daily OHLC + one 5m candle request/stock
+// keeps a 210-stock scan comfortably below the per-minute request limit.
 const CANDLE_FETCH_CONCURRENCY = 20;
 const QUOTE_FALLBACK_CONCURRENCY = 12;
 
@@ -38,6 +39,27 @@ type Quote = {
     prev_close?: number;
   };
   volume?: number;
+};
+
+type DailyOHLC = {
+  last_price?: number;
+  instrument_token?: string;
+  prev_ohlc?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    ts: number;
+  };
+  live_ohlc?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    ts: number;
+  };
 };
 
 async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<(T | null)[]> {
@@ -96,6 +118,34 @@ function normalizeQuotes(
   return normalized;
 }
 
+function normalizeDailyOHLC(
+  requestedKeys: string[],
+  response: Record<string, DailyOHLC>
+): Record<string, DailyOHLC> {
+  const normalized: Record<string, DailyOHLC> = {};
+  const entries = Object.entries(response || {});
+
+  for (const requested of requestedKeys) {
+    const direct = response?.[requested];
+    if (direct) {
+      normalized[requested] = direct;
+      continue;
+    }
+
+    const colonKey = requested.replace("|", ":");
+    const byColon = response?.[colonKey];
+    if (byColon) {
+      normalized[requested] = byColon;
+      continue;
+    }
+
+    const byToken = entries.find(([, quote]) => quote?.instrument_token === requested);
+    if (byToken?.[1]) normalized[requested] = byToken[1];
+  }
+
+  return normalized;
+}
+
 async function fetchQuotesResilient(instrumentKeys: string[], accessToken: string): Promise<Record<string, Quote>> {
   if (instrumentKeys.length === 0) return {};
 
@@ -148,8 +198,20 @@ export async function GET() {
     const allInstrumentKeys = universe.map((i) => i.instrumentKey);
     const quoteResults = await fetchQuotesResilient(allInstrumentKeys, token);
 
-    const prevDateStr = formatDateIST(getPreviousSessionDate());
-    const todayDateStr = formatDateIST(new Date());
+    // Previous-session high/low are available from one batched OHLC V3 call.
+    // This removes the old 210-request-per-day historical lookup and prevents
+    // the scanner from exhausting Upstox's 500 requests/minute limit.
+    let dailyOhlcResults: Record<string, DailyOHLC> = {};
+    try {
+      const rawDaily = await fetchDailyOHLC(allInstrumentKeys, token);
+      dailyOhlcResults = normalizeDailyOHLC(allInstrumentKeys, rawDaily);
+    } catch (error) {
+      console.warn(
+        "[prime-scan-all] Batched daily OHLC request failed; previous-day levels will be unavailable:",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
     const symbolsWithQuotes = universe.filter(
       (i) => Number(quoteResults[i.instrumentKey]?.last_price) > 0
     );
@@ -157,7 +219,6 @@ export async function GET() {
     type CandleResult = {
       symbol: string;
       intraday: RawCandle[];
-      prev: RawCandle[];
     };
 
     const toCandle = (c: (string | number)[]): RawCandle => ({
@@ -170,23 +231,21 @@ export async function GET() {
     });
 
     const candleTasks = symbolsWithQuotes.map((instrument) => async (): Promise<CandleResult> => {
-      // After market close, do NOT call Intraday + fallback for every stock.
-      // That can become 3 candle requests/stock (630 calls for 210 stocks)
-      // and cause throttling/timeouts. Historical V3 contains the completed
-      // day's 5-minute candles and is the correct source after close.
-      const sessionPromise = market.status === "CLOSED"
-        ? fetchHistoricalCandles(instrument.instrumentKey, token, todayDateStr, todayDateStr)
-        : fetchIntradayCandles(instrument.instrumentKey, token);
-
-      const [sessionRaw, histRaw] = await Promise.all([
-        sessionPromise.catch(() => []),
-        fetchHistoricalCandles(instrument.instrumentKey, token, prevDateStr, prevDateStr).catch(() => []),
-      ]);
+      // During market hours use Intraday V3. After close use today's Historical
+      // V3 candles. Either way this is exactly ONE 5-minute candle request per
+      // stock instead of the old intraday + historical + previous-day sequence.
+      const raw = market.status === "CLOSED"
+        ? await fetchHistoricalCandles(
+            instrument.instrumentKey,
+            token,
+            formatDateIST(new Date()),
+            formatDateIST(new Date())
+          )
+        : await fetchIntradayCandles(instrument.instrumentKey, token);
 
       return {
         symbol: instrument.symbol,
-        intraday: [...(sessionRaw as unknown as (string | number)[][])].reverse().map(toCandle),
-        prev: [...(histRaw as unknown as (string | number)[][])].reverse().map(toCandle),
+        intraday: [...(raw as unknown as (string | number)[][])].reverse().map(toCandle),
       };
     });
 
@@ -198,11 +257,12 @@ export async function GET() {
 
     const rows = universe.map((instrument) => {
       const quote = quoteResults[instrument.instrumentKey];
+      const daily = dailyOhlcResults[instrument.instrumentKey];
       const candleData = candleMap.get(instrument.symbol);
       const ltp = quote?.last_price ?? null;
       const prevClose =
         quote?.ohlc?.prev_close ??
-        candleData?.prev?.[candleData.prev.length - 1]?.close ??
+        daily?.prev_ohlc?.close ??
         quote?.ohlc?.close ??
         null;
 
@@ -211,9 +271,8 @@ export async function GET() {
           ? ((ltp - prevClose) / prevClose) * 100
           : null;
 
-      const prevCandles = candleData?.prev ?? [];
-      const prevHigh = prevCandles.length ? Math.max(...prevCandles.map((c) => c.high)) : null;
-      const prevLow = prevCandles.length ? Math.min(...prevCandles.map((c) => c.low)) : null;
+      const prevHigh = daily?.prev_ohlc?.high ?? null;
+      const prevLow = daily?.prev_ohlc?.low ?? null;
 
       return scanInstrument({
         symbol: instrument.symbol,
@@ -224,7 +283,7 @@ export async function GET() {
         isin: instrument.isin,
         ltp,
         dayChangePct: dayChangePct !== null ? parseFloat(dayChangePct.toFixed(2)) : null,
-        open: quote?.ohlc?.open ?? null,
+        open: quote?.ohlc?.open ?? daily?.live_ohlc?.open ?? null,
         prevClose,
         prevHigh,
         prevLow,
