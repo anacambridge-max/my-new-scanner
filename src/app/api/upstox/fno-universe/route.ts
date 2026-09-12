@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const universe = getFnOUniverse();
+    const universe = await getFnOUniverse();
     const market = getMarketStatus();
 
     return Response.json({
