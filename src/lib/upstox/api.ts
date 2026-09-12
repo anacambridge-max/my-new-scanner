@@ -54,25 +54,28 @@ export async function fetchHistoricalCandles(
   fromDate?: string,
   toDate?: string
 ): Promise<UpstoxHistoricalCandle[]> {
-  const to = toDate || formatDate(new Date());
-  const from = fromDate || formatDate(offsetDays(new Date(), -5));
+  const to = toDate || formatDateIST(new Date());
+  const from = fromDate || formatDateIST(offsetDays(new Date(), -5));
 
   const encodedKey = encodeURIComponent(instrumentKey);
   const url = `${UPSTOX_V3_BASE}/historical-candle/${encodedKey}/minutes/5/${to}/${from}`;
 
   const response = await axios.get(url, {
     headers: upstoxHeaders(accessToken),
-    timeout: 15000,
+    timeout: 10000,
   });
 
   return response.data?.data?.candles || [];
 }
 
 /**
- * Fetch current-session 5-minute candles.
- * Primary path is Upstox Intraday Candle V3. If that endpoint returns an
- * error/empty payload, fall back to Historical Candle V3 for today's date.
- * This is important after market close, when intraday availability can vary.
+ * Fetch the current trading day's 5-minute candles.
+ *
+ * Upstox documents the V3 intraday endpoint for 5-minute candles, but after
+ * the market closes some environments can return an empty intraday payload.
+ * In that case we deliberately use the V3 historical endpoint over a small
+ * date window and keep only today's IST candles. This avoids losing the
+ * candle/volume/EMA pipeline merely because the market is closed.
  */
 export async function fetchIntradayCandles(
   instrumentKey: string,
@@ -84,7 +87,7 @@ export async function fetchIntradayCandles(
   try {
     const response = await axios.get(intradayUrl, {
       headers: upstoxHeaders(accessToken),
-      timeout: 15000,
+      timeout: 8000,
     });
     const candles = response.data?.data?.candles || [];
     if (Array.isArray(candles) && candles.length > 0) return candles;
@@ -95,8 +98,21 @@ export async function fetchIntradayCandles(
     );
   }
 
-  const today = formatDate(new Date());
-  return fetchHistoricalCandles(instrumentKey, accessToken, today, today);
+  // Historical V3 is more reliable after market close. Query a small window
+  // (yesterday -> today) and filter by the actual IST calendar date.
+  const today = formatDateIST(new Date());
+  const yesterday = formatDateIST(offsetDays(new Date(), -1));
+  const historical = await fetchHistoricalCandles(
+    instrumentKey,
+    accessToken,
+    yesterday,
+    today
+  );
+
+  return historical.filter((candle) => {
+    const timestamp = String(candle?.[0] ?? "");
+    return timestamp.slice(0, 10) === today;
+  });
 }
 
 /**
@@ -180,8 +196,18 @@ export async function exchangeCodeForToken(
   return response.data;
 }
 
-function formatDate(date: Date): string {
-  return date.toISOString().split("T")[0];
+function formatDateIST(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((p) => p.type === "year")?.value;
+  const month = parts.find((p) => p.type === "month")?.value;
+  const day = parts.find((p) => p.type === "day")?.value;
+  return `${year}-${month}-${day}`;
 }
 
 function offsetDays(date: Date, days: number): Date {
