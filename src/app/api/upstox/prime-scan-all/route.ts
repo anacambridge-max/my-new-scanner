@@ -15,9 +15,12 @@ const QUOTE_FALLBACK_CONCURRENCY = 12;
 type Quote = { last_price: number; net_change?: number; instrument_token?: string; symbol?: string; prev_close_price?: number; year_high?: number; year_low?: number; ohlc?: { open: number; high: number; low: number; close: number; prev_close?: number }; volume?: number };
 type DailyOHLC = { last_price?: number; instrument_token?: string; prev_ohlc?: { open: number; high: number; low: number; close: number; volume: number; ts: number }; live_ohlc?: { open: number; high: number; low: number; close: number; volume: number; ts: number } };
 
+type KeyedQuote = { instrument_token?: string; symbol?: string };
 async function withConcurrency<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<(T | null)[]> { const results: (T | null)[] = new Array(tasks.length).fill(null); let idx = 0; async function worker() { while (idx < tasks.length) { const current = idx++; try { results[current] = await tasks[current](); } catch { results[current] = null; } } } await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker())); return results; }
 
-function normalizeByInstrumentKey<T extends { instrument_token?: string; symbol?: string }>(requestedKeys: string[], response: Record<string, T>): Record<string, T> { const normalized: Record<string, T> = {}; const entries = Object.entries(response || {}); for (const requested of requestedKeys) { const direct = response?.[requested]; if (direct) { normalized[requested] = direct; continue; } const colon = response?.[requested.replace("|", ":")]; if (colon) { normalized[requested] = colon; continue; } const byToken = entries.find(([, value]) => value?.instrument_token === requested); if (byToken?.[1]) { normalized[requested] = byToken[1]; continue; } const symbol = requested.split("|")[1]; const bySymbol = entries.find(([, value]) => value?.symbol === symbol); if (bySymbol?.[1]) normalized[requested] = bySymbol[1]; } return normalized; }
+function normalizeByInstrumentKey<T extends KeyedQuote>(requestedKeys: string[], response: Record<string, T>): Record<string, T> { const normalized: Record<string, T> = {}; const entries = Object.entries(response || {}); for (const requested of requestedKeys) { const direct = response?.[requested]; if (direct) { normalized[requested] = direct; continue; } const colon = response?.[requested.replace("|", ":")]; if (colon) { normalized[requested] = colon; continue; } const byToken = entries.find(([, value]) => value?.instrument_token === requested); if (byToken?.[1]) { normalized[requested] = byToken[1]; continue; } const symbol = requested.split("|")[1]; const bySymbol = entries.find(([, value]) => value?.symbol === symbol); if (bySymbol?.[1]) normalized[requested] = bySymbol[1]; } return normalized; }
+
+function normalizeLtpByKey(requestedKeys: string[], response: Record<string, { last_price: number }>): Record<string, Quote> { const out: Record<string, Quote> = {}; for (const requested of requestedKeys) { const direct = response?.[requested]; const colon = response?.[requested.replace("|", ":")]; const value = direct ?? colon; if (value && Number(value.last_price) > 0) out[requested] = { last_price: Number(value.last_price) }; } return out; }
 
 async function fetchQuotesResilient(keys: string[], token: string): Promise<Record<string, Quote>> {
   try {
@@ -26,20 +29,10 @@ async function fetchQuotesResilient(keys: string[], token: string): Promise<Reco
     if (Object.keys(normalized).length) return normalized;
   } catch (e) { console.warn("[prime] quote batch failed", e instanceof Error ? e.message : String(e)); }
 
-  // LTP is a simpler Upstox endpoint and returns the requested instrument-key
-  // mapping directly. Use it before making 210 individual full-quote calls.
   try {
     const rawLtp = await fetchLTP(keys, token) as Record<string, { last_price: number }>;
-    const normalizedLtp = normalizeByInstrumentKey(keys, rawLtp);
-    if (Object.keys(normalizedLtp).length) return normalizedLtp as Record<string, Quote>;
-    if (Object.keys(rawLtp || {}).length) {
-      const out: Record<string, Quote> = {};
-      for (const key of keys) {
-        const value = rawLtp[key] ?? rawLtp[key.replace("|", ":")];
-        if (value && Number(value.last_price) > 0) out[key] = value as Quote;
-      }
-      if (Object.keys(out).length) return out;
-    }
+    const normalizedLtp = normalizeLtpByKey(keys, rawLtp);
+    if (Object.keys(normalizedLtp).length) return normalizedLtp;
   } catch (e) { console.warn("[prime] LTP fallback failed", e instanceof Error ? e.message : String(e)); }
 
   const tasks = keys.map(key => async () => { const raw = await fetchMarketQuotes([key], token) as Record<string, Quote>; const normalized = normalizeByInstrumentKey([key], raw); return { key, quote: normalized[key] ?? Object.values(raw || {})[0] ?? null }; });
