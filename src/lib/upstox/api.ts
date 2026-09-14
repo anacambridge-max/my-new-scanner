@@ -22,6 +22,7 @@ export interface UpstoxQuote {
   net_change: number;
   instrument_token?: string;
   symbol?: string;
+  prev_close_price?: number;
   ohlc?: {
     open: number;
     high: number;
@@ -55,11 +56,11 @@ export interface UpstoxDailyOHLC {
   };
 }
 
-function upstoxHeaders(accessToken: string) {
+function upstoxHeaders(accessToken: string, includeApiVersion = true) {
   return {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/json",
-    "Api-Version": "2.0",
+    ...(includeApiVersion ? { "Api-Version": "2.0" } : {}),
   };
 }
 
@@ -73,7 +74,7 @@ export async function fetchHistoricalCandles(
   const from = fromDate || formatDateIST(offsetDays(new Date(), -5));
   const encodedKey = encodeURIComponent(instrumentKey);
   const url = `${UPSTOX_V3_BASE}/historical-candle/${encodedKey}/minutes/5/${to}/${from}`;
-  const response = await axios.get(url, { headers: upstoxHeaders(accessToken), timeout: 10000 });
+  const response = await axios.get(url, { headers: upstoxHeaders(accessToken, false), timeout: 10000 });
   return response.data?.data?.candles || [];
 }
 
@@ -86,7 +87,7 @@ export async function fetchIntradayCandles(
 
   try {
     const response = await axios.get(intradayUrl, {
-      headers: upstoxHeaders(accessToken),
+      headers: upstoxHeaders(accessToken, false),
       timeout: 8000,
     });
     const candles = response.data?.data?.candles || [];
@@ -107,13 +108,12 @@ export async function fetchDailyOHLC(
   if (instrumentKeys.length === 0) return {};
 
   const combined: Record<string, UpstoxDailyOHLC> = {};
-  // Keep query strings comfortably sized even for large F&O universes.
   for (let i = 0; i < instrumentKeys.length; i += 50) {
     const chunk = instrumentKeys.slice(i, i + 50);
     const keysParam = chunk.join(",");
     const url = `${UPSTOX_V3_BASE}/market-quote/ohlc?instrument_key=${encodeURIComponent(keysParam)}&interval=1d`;
     const response = await axios.get(url, {
-      headers: upstoxHeaders(accessToken),
+      headers: upstoxHeaders(accessToken, false),
       timeout: 15000,
     });
     Object.assign(combined, response.data?.data || {});
@@ -122,8 +122,9 @@ export async function fetchDailyOHLC(
 }
 
 /**
- * Full market quotes V3. Upstox documents up to 500 instruments per request
- * and exposes prev_close_price, year_high and year_low directly.
+ * Full market quotes. V3 is preferred, with V2 as a compatibility fallback.
+ * Upstox returns quote objects keyed as EXCHANGE:SYMBOL rather than the
+ * requested NSE_EQ|ISIN instrument key, so callers normalize by token/symbol.
  */
 export async function fetchMarketQuotes(
   instrumentKeys: string[],
@@ -131,12 +132,28 @@ export async function fetchMarketQuotes(
 ): Promise<Record<string, UpstoxQuote>> {
   if (instrumentKeys.length === 0) return {};
   const keysParam = instrumentKeys.join(",");
-  const url = `${UPSTOX_V3_BASE}/market-quote/quotes?instrument_key=${encodeURIComponent(keysParam)}`;
-  const response = await axios.get(url, {
-    headers: upstoxHeaders(accessToken),
-    timeout: 20000,
-  });
-  return response.data?.data || {};
+  const errors: string[] = [];
+
+  for (const version of ["v3", "v2"] as const) {
+    try {
+      const base = version === "v3" ? UPSTOX_V3_BASE : UPSTOX_V2_BASE;
+      const url = `${base}/market-quote/quotes?instrument_key=${encodeURIComponent(keysParam)}`;
+      const response = await axios.get(url, {
+        headers: upstoxHeaders(accessToken, version === "v2"),
+        timeout: 20000,
+      });
+      const data = response.data?.data;
+      if (data && typeof data === "object" && Object.keys(data).length > 0) {
+        return data as Record<string, UpstoxQuote>;
+      }
+      errors.push(`${version}: empty quote data`);
+    } catch (error) {
+      errors.push(`${version}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  console.warn(`[Upstox] market quotes failed: ${errors.join(" | ")}`);
+  return {};
 }
 
 export async function fetchLTP(
